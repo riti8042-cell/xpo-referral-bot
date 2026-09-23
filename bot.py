@@ -504,6 +504,145 @@ async def admin_withdraw_action(update, context):
             pass
 
 
+def admin_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📊 Overview", callback_data="admin_overview"),
+         InlineKeyboardButton("👥 Referrals", callback_data="admin_referrals")],
+        [InlineKeyboardButton("💸 Pending Withdrawals", callback_data="admin_pending")],
+    ])
+
+
+def admin_overview_text():
+    conn = db()
+    total_users = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+    joined_users = conn.execute("SELECT COUNT(*) FROM users WHERE joined=1").fetchone()[0]
+    total_referrals = conn.execute("SELECT COALESCE(SUM(referrals),0) FROM users").fetchone()[0]
+    total_rewards = conn.execute("SELECT COALESCE(SUM(balance),0) FROM users").fetchone()[0]
+    pending = conn.execute("SELECT COUNT(*) FROM withdrawals WHERE status='pending'").fetchone()[0]
+    paid = conn.execute("SELECT COUNT(*) FROM withdrawals WHERE status='paid'").fetchone()[0]
+    conn.close()
+    return (
+        "👑 ADMIN PANEL\n\n"
+        f"👤 Total users: {total_users}\n"
+        f"✅ Verified channel users: {joined_users}\n"
+        f"👥 Successful referrals: {total_referrals}\n"
+        f"💰 Current user balances: {total_rewards:.2f} USDT\n"
+        f"⏳ Pending withdrawals: {pending}\n"
+        f"✅ Paid withdrawals: {paid}\n\n"
+        "Use the buttons below to inspect referral activity."
+    )
+
+
+def admin_referrals_text():
+    conn = db()
+    rows = conn.execute(
+        "SELECT id, username, referrals, balance FROM users WHERE referrals > 0 ORDER BY referrals DESC, id ASC LIMIT 15"
+    ).fetchall()
+    recent = conn.execute(
+        "SELECT u.id, u.username, u.referrer, r.username AS ref_username "
+        "FROM users u LEFT JOIN users r ON r.id=u.referrer "
+        "WHERE u.joined=1 AND u.referrer IS NOT NULL "
+        "ORDER BY u.id DESC LIMIT 10"
+    ).fetchall()
+    conn.close()
+
+    lines = ["👥 REFERRAL REPORT", ""]
+    if rows:
+        lines.append("🏆 Top referrers:")
+        for i, r in enumerate(rows, 1):
+            name = f"@{r['username']}" if r['username'] else f"ID {r['id']}"
+            lines.append(f"{i}. {name} — {r['referrals']} referrals — {r['balance']:.2f} USDT")
+    else:
+        lines.append("No successful referrals yet.")
+
+    lines += ["", "🆕 Recent successful referrals:"]
+    if recent:
+        for r in recent:
+            new_name = f"@{r['username']}" if r['username'] else f"ID {r['id']}"
+            ref_name = f"@{r['ref_username']}" if r['ref_username'] else f"ID {r['referrer']}"
+            lines.append(f"• {new_name} ← {ref_name}")
+    else:
+        lines.append("No successful referrals yet.")
+    lines += ["", "Use /referrals USER_ID to see one user's referrals."]
+    return "\n".join(lines)
+
+
+async def admin_command(update, context):
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("❌ Admin only.")
+        return
+    await update.message.reply_text(admin_overview_text(), reply_markup=admin_keyboard())
+
+
+async def admin_referrals_command(update, context):
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("❌ Admin only.")
+        return
+    if not context.args:
+        await update.message.reply_text(admin_referrals_text(), reply_markup=admin_keyboard())
+        return
+    try:
+        uid = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("Usage: /referrals USER_ID")
+        return
+    conn = db()
+    owner = conn.execute("SELECT id, username, referrals, balance FROM users WHERE id=?", (uid,)).fetchone()
+    rows = conn.execute(
+        "SELECT id, username, created_at FROM users WHERE referrer=? AND joined=1 ORDER BY id DESC", (uid,)
+    ).fetchall()
+    conn.close()
+    if not owner:
+        await update.message.reply_text("❌ User not found.")
+        return
+    name = f"@{owner['username']}" if owner['username'] else f"ID {owner['id']}"
+    lines = [
+        f"👤 REFERRAL DETAILS",
+        f"User: {name}",
+        f"ID: {owner['id']}",
+        f"👥 Successful referrals: {len(rows)}",
+        f"💰 Balance: {owner['balance']:.2f} USDT",
+        "",
+        "Referred users:"
+    ]
+    if rows:
+        for r in rows[:50]:
+            n = f"@{r['username']}" if r['username'] else f"ID {r['id']}"
+            lines.append(f"• {n} (ID {r['id']})")
+    else:
+        lines.append("None yet.")
+    await update.message.reply_text("\n".join(lines), reply_markup=admin_keyboard())
+
+
+async def admin_callback(update, context):
+    q = update.callback_query
+    if q.from_user.id != ADMIN_ID:
+        await q.answer("Not authorized.", show_alert=True)
+        return
+    await q.answer()
+    if q.data == "admin_overview":
+        await q.edit_message_text(admin_overview_text(), reply_markup=admin_keyboard())
+    elif q.data == "admin_referrals":
+        await q.edit_message_text(admin_referrals_text(), reply_markup=admin_keyboard())
+    elif q.data == "admin_pending":
+        conn = db()
+        rows = conn.execute(
+            "SELECT w.id, w.user_id, u.username, w.amount, w.network, w.wallet, w.created_at "
+            "FROM withdrawals w LEFT JOIN users u ON u.id=w.user_id "
+            "WHERE w.status='pending' ORDER BY w.id DESC LIMIT 20"
+        ).fetchall()
+        conn.close()
+        if not rows:
+            text = "💸 PENDING WITHDRAWALS\n\nNo pending withdrawals."
+        else:
+            lines = ["💸 PENDING WITHDRAWALS", ""]
+            for r in rows:
+                name = f"@{r['username']}" if r['username'] else f"ID {r['user_id']}"
+                lines.append(f"#{r['id']} • {name} • {r['amount']:.2f} USDT • {r['network']}")
+            text = "\n".join(lines)
+        await q.edit_message_text(text, reply_markup=admin_keyboard())
+
+
 async def menu_callback(update, context):
     q = update.callback_query
     await q.answer()
@@ -563,6 +702,7 @@ async def post_init(app):
         BotCommand("withdraw", "Request withdrawal"),
         BotCommand("history", "Withdrawal history"),
         BotCommand("help", "Help"),
+        BotCommand("admin", "Admin panel"),
     ])
 
 
@@ -578,6 +718,8 @@ def main():
     app.add_handler(CommandHandler("stats", stats_text))
     app.add_handler(CommandHandler("history", history_text))
     app.add_handler(CommandHandler("help", help_text))
+    app.add_handler(CommandHandler("admin", admin_command))
+    app.add_handler(CommandHandler("referrals", admin_referrals_command))
 
     withdraw_conv = ConversationHandler(
         entry_points=[CommandHandler("withdraw", withdraw_start)],
@@ -596,6 +738,7 @@ def main():
     app.add_handler(CallbackQueryHandler(withdraw_network, pattern=r"^net_"))
     app.add_handler(CallbackQueryHandler(cancel_withdraw, pattern=r"^cancel_withdraw$"))
     app.add_handler(CallbackQueryHandler(admin_withdraw_action, pattern=r"^admin_(paid|reject)_\d+$"))
+    app.add_handler(CallbackQueryHandler(admin_callback, pattern=r"^admin_(overview|referrals|pending)$"))
 
     app.run_polling()
 
